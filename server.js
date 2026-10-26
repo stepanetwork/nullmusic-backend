@@ -1,7 +1,7 @@
+
 const express = require('express');
 const cors = require('cors');
-const ytsr = require('ytsr');
-const play = require('play-dl');
+const axios = require('axios');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -9,70 +9,105 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// Пинг для проверки работоспособности
+// Пинг для проверки работы
 app.get('/', (req, res) => {
-  res.send('nullmusic API is online');
+  res.send({ status: 'ok', service: 'nullmusic core api' });
 });
 
-// 1. Поиск полных оригинальных треков и обложек
+// Открытые зеркала для поиска полных треков
+const INVIDIOUS_INSTANCES = [
+  'https://inv.nadeko.net',
+  'https://invidious.private.coffee',
+  'https://yewtu.be',
+  'https://iv.melmac.space'
+];
+
+// Поиск полных треков и оригинальных обложек
 app.get('/api/search', async (req, res) => {
-  try {
-    const q = req.query.q;
-    if (!q) return res.status(400).json({ error: 'Query required' });
+  const query = req.query.q;
+  if (!query) return res.status(400).json({ error: 'Query is required' });
 
-    // Ищем музыкальные треки без цензуры
-    const searchResults = await ytsr(q, { limit: 25 });
-    const items = searchResults.items.filter(i => i.type === 'video');
+  for (const instance of INVIDIOUS_INSTANCES) {
+    try {
+      const response = await axios.get(`${instance}/api/v1/search`, {
+        params: { q: query, type: 'video' },
+        timeout: 4500
+      });
 
-    const tracks = items.map(item => {
-      // Парсим длительность из формата mm:ss в секунды
-      let rawSec = 180;
-      if (item.duration) {
-        const parts = item.duration.split(':').map(Number);
-        if (parts.length === 2) rawSec = parts[0] * 60 + parts[1];
-        if (parts.length === 3) rawSec = parts[0] * 3600 + parts[1] * 60 + parts[2];
+      if (response.data && Array.isArray(response.data)) {
+        const tracks = response.data
+          .filter(v => v.lengthSeconds && v.lengthSeconds > 40 && v.lengthSeconds < 1200)
+          .map(v => {
+            const min = Math.floor(v.lengthSeconds / 60);
+            const sec = v.lengthSeconds % 60;
+            const thumb = (v.videoThumbnails && v.videoThumbnails.length > 0)
+              ? v.videoThumbnails[v.videoThumbnails.length - 1].url
+              : `https://images.weserv.nl/?url=i.ytimg.com/vi/${v.videoId}/hqdefault.jpg`;
+
+            return {
+              id: v.videoId,
+              title: v.title,
+              artist: v.author ? v.author.replace(' - Topic', '') : 'Исполнитель',
+              duration: `${min}:${sec < 10 ? '0' : ''}${sec}`,
+              rawDuration: v.lengthSeconds,
+              cover: thumb,
+              streamUrl: `/api/stream/${v.videoId}`
+            };
+          });
+
+        return res.json({ tracks });
       }
+    } catch (e) {
+      // Пробуем следующее зеркало
+    }
+  }
 
-      // Достаем оригинальную обложку
-      const thumb = (item.thumbnails && item.thumbnails.length > 0)
-        ? item.thumbnails[item.thumbnails.length - 1].url
-        : (item.bestThumbnail ? item.bestThumbnail.url : '');
-
-      return {
-        id: item.id,
-        title: item.title,
-        artist: item.author ? item.author.name.replace(' - Topic', '') : 'Исполнитель',
-        duration: item.duration || '3:00',
-        rawDuration: rawSec,
-        cover: thumb,
-        streamUrl: `/api/stream/${item.id}`
-      };
+  // Резервный поиск через открытый шлюз
+  try {
+    const backupRes = await axios.get(`https://itunes.apple.com/search`, {
+      params: { term: query, country: 'RU', media: 'music', limit: 25 },
+      timeout: 3000
     });
-
-    res.json({ tracks });
+    const fallbackTracks = (backupRes.data.results || []).map(r => ({
+      id: String(r.trackId),
+      title: r.trackName,
+      artist: r.artistName,
+      duration: '3:00',
+      rawDuration: 180,
+      cover: r.artworkUrl100 ? r.artworkUrl100.replace('100x100bb', '500x500bb') : '',
+      streamUrl: r.previewUrl
+    }));
+    return res.json({ tracks: fallbackTracks });
   } catch (err) {
-    console.error('Search error:', err);
     res.status(500).json({ error: 'Search failed' });
   }
 });
 
-// 2. Стриминг полного аудиопотока
+// Стриминг полного аудиопотока
 app.get('/api/stream/:id', async (req, res) => {
-  try {
-    const videoId = req.params.id;
-    const info = await play.video_info(`https://www.youtube.com/watch?v=${videoId}`);
-    const stream = await play.stream_from_info(info);
+  const videoId = req.params.id;
 
-    res.setHeader('Content-Type', stream.type || 'audio/webm');
-    res.setHeader('Accept-Ranges', 'bytes');
-    stream.stream.pipe(res);
-  } catch (err) {
-    console.error('Stream error:', err);
-    res.status(500).json({ error: 'Stream failed' });
+  for (const instance of INVIDIOUS_INSTANCES) {
+    try {
+      const streamUrl = `${instance}/latest_version?id=${videoId}&itag=140`;
+      const response = await axios({
+        method: 'get',
+        url: streamUrl,
+        responseType: 'stream',
+        timeout: 6000
+      });
+
+      res.setHeader('Content-Type', 'audio/mp4');
+      return response.data.pipe(res);
+    } catch (e) {
+      // Пробуем следующий инстанс
+    }
   }
+
+  res.status(502).json({ error: 'Audio stream unavailable' });
 });
 
 app.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
+  console.log(`nullmusic server running on port ${PORT}`);
 });
 ```
