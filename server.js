@@ -1,4 +1,3 @@
-
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -9,12 +8,12 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// Пинг для проверки работы
+// Проверка активности сервера
 app.get('/', (req, res) => {
   res.send({ status: 'ok', service: 'nullmusic core api' });
 });
 
-// Открытые зеркала для поиска полных треков
+// Открытые рабочие зеркала Invidious
 const INVIDIOUS_INSTANCES = [
   'https://inv.nadeko.net',
   'https://invidious.private.coffee',
@@ -22,7 +21,7 @@ const INVIDIOUS_INSTANCES = [
   'https://iv.melmac.space'
 ];
 
-// Поиск полных треков и оригинальных обложек
+// Поиск треков
 app.get('/api/search', async (req, res) => {
   const query = req.query.q;
   if (!query) return res.status(400).json({ error: 'Query is required' });
@@ -58,11 +57,11 @@ app.get('/api/search', async (req, res) => {
         return res.json({ tracks });
       }
     } catch (e) {
-      // Пробуем следующее зеркало
+      // Переход к следующему зеркалу при ошибке
     }
   }
 
-  // Резервный поиск через открытый шлюз
+  // Резервный поиск
   try {
     const backupRes = await axios.get(`https://itunes.apple.com/search`, {
       params: { term: query, country: 'RU', media: 'music', limit: 25 },
@@ -83,7 +82,7 @@ app.get('/api/search', async (req, res) => {
   }
 });
 
-// Стриминг полного аудиопотока
+// Стриминг аудиопотока
 app.get('/api/stream/:id', async (req, res) => {
   const videoId = req.params.id;
 
@@ -100,7 +99,7 @@ app.get('/api/stream/:id', async (req, res) => {
       res.setHeader('Content-Type', 'audio/mp4');
       return response.data.pipe(res);
     } catch (e) {
-      // Пробуем следующий инстанс
+      // Переход к следующему инстансу
     }
   }
 
