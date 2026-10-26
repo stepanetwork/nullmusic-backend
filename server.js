@@ -81,56 +81,60 @@ const server = http.createServer(async (req, res) => {
     const cleanQuery = query.trim();
     let tracks = [];
 
-    // Список актуальных поисковых зеркал с открытым API
-    const endpoints = [
-      `https://invidious.nerdvpn.de/api/v1/search?q=${encodeURIComponent(cleanQuery)}&type=video`,
-      `https://inv.nadeko.net/api/v1/search?q=${encodeURIComponent(cleanQuery)}&type=video`,
-      `https://invidious.drgns.space/api/v1/search?q=${encodeURIComponent(cleanQuery)}&type=video`,
-      `https://pipedapi.kavin.rocks/search?q=${encodeURIComponent(cleanQuery)}&filter=music_songs`
+    // 1. Поиск полных аудиопотоков через открытые узлы Audius Discovery
+    const audiusHosts = [
+      'https://discoveryprovider.audius.co',
+      'https://discoveryprovider2.audius.co',
+      'https://discoveryprovider3.audius.co'
     ];
 
-    for (const ep of endpoints) {
+    let audiusStreams = [];
+    for (const host of audiusHosts) {
       try {
-        const data = await fetchJson(ep, 4500);
-        const items = Array.isArray(data) ? data : (data.items || []);
-
-        if (items.length > 0) {
-          tracks = items
-            .filter(item => item.title && (item.videoId || item.url || item.id))
-            .slice(0, 25)
-            .map(item => {
-              const id = item.videoId || (item.url ? item.url.replace('/watch?v=', '') : item.id);
-              const durSec = item.lengthSeconds || item.duration || 180;
-              
-              let thumb = '';
-              if (item.videoThumbnails && item.videoThumbnails.length > 0) {
-                thumb = item.videoThumbnails[item.videoThumbnails.length - 1].url;
-              } else if (item.thumbnail) {
-                thumb = item.thumbnail;
-              } else {
-                thumb = `https://i.ytimg.com/vi/${id}/hqdefault.jpg`;
-              }
-              if (thumb.startsWith('//')) thumb = 'https:' + thumb;
-
-              const cleanThumb = thumb.replace(/^https?:\/\//, '');
-
-              return {
-                id: id,
-                title: item.title,
-                artist: item.author || item.uploaderName || item.uploader || 'Исполнитель',
-                duration: formatDuration(durSec),
-                rawDuration: durSec,
-                cover: `https://images.weserv.nl/?url=${encodeURIComponent(cleanThumb)}&w=500&h=500&fit=cover`,
-                streamUrl: `https://invidious.nerdvpn.de/latest_version?id=${id}&itag=140`
-              };
-            });
-
-          if (tracks.length > 0) break;
+        const aData = await fetchJson(`${host}/v1/tracks/search?query=${encodeURIComponent(cleanQuery)}&app_name=nullmusic`, 4000);
+        if (aData && Array.isArray(aData.data) && aData.data.length > 0) {
+          audiusStreams = aData.data.map(item => ({
+            id: item.id,
+            title: item.title || 'Без названия',
+            artist: (item.user && item.user.name) ? item.user.name : 'Исполнитель',
+            duration: formatDuration(item.duration || 180),
+            rawDuration: item.duration || 180,
+            cover: (item.artwork && (item.artwork['480x480'] || item.artwork['150x150'])) || '',
+            streamUrl: `${host}/v1/tracks/${item.id}/stream?app_name=nullmusic`
+          }));
+          break;
         }
-      } catch (err) {
-        // Пробуем следующее зеркало
+      } catch (e) {
         continue;
       }
+    }
+
+    // 2. Поиск точного каталога артистов и оригинальных HD-обложек
+    try {
+      const catUrl = `https://itunes.apple.com/search?term=${encodeURIComponent(cleanQuery)}&country=RU&media=music&entity=song&limit=25`;
+      const catData = await fetchJson(catUrl, 4500);
+      if (catData && Array.isArray(catData.results) && catData.results.length > 0) {
+        tracks = catData.results.map((item, idx) => {
+          const durSec = item.trackTimeMillis ? Math.round(item.trackTimeMillis / 1000) : 180;
+          const hiResCover = item.artworkUrl100 ? item.artworkUrl100.replace('100x100bb', '600x600bb') : '';
+          const matchedStream = audiusStreams[idx] ? audiusStreams[idx].streamUrl : '';
+
+          return {
+            id: String(item.trackId || idx),
+            title: item.trackName || 'Без названия',
+            artist: item.artistName || 'Исполнитель',
+            duration: formatDuration(durSec),
+            rawDuration: durSec,
+            cover: hiResCover,
+            streamUrl: matchedStream || item.previewUrl || '',
+            backupUrl: item.previewUrl || ''
+          };
+        });
+      }
+    } catch (e) {}
+
+    if (tracks.length === 0 && audiusStreams.length > 0) {
+      tracks = audiusStreams;
     }
 
     res.writeHead(200, { 'Content-Type': 'application/json' });
