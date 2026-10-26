@@ -43,32 +43,6 @@ function fetchJson(targetUrl, timeoutMs = 6000) {
   });
 }
 
-function formatDuration(sec) {
-  if (!sec || isNaN(sec)) return '—';
-  const m = Math.floor(sec / 60);
-  const s = Math.floor(sec % 60);
-  return `${m}:${s < 10 ? '0' : ''}${s}`;
-}
-
-// Поиск полного MP3 в открытом архиве Internet Archive по идентификатору элемента
-async function resolveArchiveMp3(identifier) {
-  try {
-    const meta = await fetchJson(`https://archive.org/metadata/${encodeURIComponent(identifier)}`, 4500);
-    if (meta && Array.isArray(meta.files)) {
-      const mp3File = meta.files.find(f =>
-        f.name && f.name.toLowerCase().endsWith('.mp3') && (!f.Length || parseFloat(f.Length) > 45)
-      );
-      if (mp3File) {
-        return {
-          url: `https://archive.org/download/${encodeURIComponent(identifier)}/${encodeURIComponent(mp3File.name)}`,
-          duration: mp3File.length ? Math.round(parseFloat(mp3File.length)) : null
-        };
-      }
-    }
-  } catch (e) {}
-  return null;
-}
-
 const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
@@ -86,58 +60,7 @@ const server = http.createServer(async (req, res) => {
     return res.end(JSON.stringify({ status: 'ok', uptime: process.uptime() }));
   }
 
-  // Эндпоинт для резолва полного аудиопотока по названию и артисту
-  if (parsedUrl.pathname === '/api/resolve-stream') {
-    const q = (parsedUrl.query.q || '').trim();
-    if (!q) {
-      res.writeHead(400, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ streamUrl: '' }));
-    }
-
-    // 1. Проверяем открытые узлы Audius
-    const audiusHosts = [
-      'https://discoveryprovider.audius.co',
-      'https://discoveryprovider2.audius.co',
-      'https://discoveryprovider3.audius.co'
-    ];
-    for (const host of audiusHosts) {
-      try {
-        const aData = await fetchJson(`${host}/v1/tracks/search?query=${encodeURIComponent(q)}&app_name=nullmusic`, 3500);
-        if (aData && Array.isArray(aData.data) && aData.data.length > 0) {
-          const best = aData.data.find(t => (t.duration || 0) > 45) || aData.data[0];
-          if (best && best.id) {
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            return res.end(JSON.stringify({
-              streamUrl: `${host}/v1/tracks/${best.id}/stream?app_name=nullmusic`,
-              duration: best.duration || 180
-            }));
-          }
-        }
-      } catch (e) {}
-    }
-
-    // 2. Проверяем открытый аудио-каталог Internet Archive
-    try {
-      const iaSearchUrl = `https://archive.org/advancedsearch.php?q=${encodeURIComponent(q + ' AND mediatype:(audio)')}&fl[]=identifier,title,creator&rows=5&page=1&output=json`;
-      const iaData = await fetchJson(iaSearchUrl, 4500);
-      const docs = iaData?.response?.docs || [];
-      for (const doc of docs) {
-        const resolved = await resolveArchiveMp3(doc.identifier);
-        if (resolved && resolved.url) {
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          return res.end(JSON.stringify({
-            streamUrl: resolved.url,
-            duration: resolved.duration
-          }));
-        }
-      }
-    } catch (e) {}
-
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ streamUrl: '' }));
-  }
-
-  // Гибридный поиск: Метаданные из iTunes + полные потоки из Audius и Internet Archive
+  // Поиск через публичные шлюзы Invidious / Piped (YouTube Music бэкенд)
   if (parsedUrl.pathname === '/api/search') {
     const query = parsedUrl.query.q;
     if (!query || !query.trim()) {
@@ -146,86 +69,51 @@ const server = http.createServer(async (req, res) => {
     }
 
     const cleanQuery = query.trim();
-
-    const audiusHosts = [
-      'https://discoveryprovider.audius.co',
-      'https://discoveryprovider2.audius.co',
-      'https://discoveryprovider3.audius.co'
+    const instances = [
+      'https://vid.puffyan.us',
+      'https://invidious.nerdvpn.de',
+      'https://inv.nadeko.net',
+      'https://invidious.drgns.space'
     ];
 
-    const audiusPromise = (async () => {
-      for (const host of audiusHosts) {
-        try {
-          const aData = await fetchJson(`${host}/v1/tracks/search?query=${encodeURIComponent(cleanQuery)}&app_name=nullmusic`, 4000);
-          if (aData && Array.isArray(aData.data) && aData.data.length > 0) {
-            return aData.data.map(item => ({
-              id: `aud_${item.id}`,
-              title: item.title || 'Без названия',
-              artist: (item.user && item.user.name) ? item.user.name : 'Исполнитель',
-              duration: formatDuration(item.duration || 180),
-              rawDuration: item.duration || 180,
-              cover: (item.artwork && (item.artwork['480x480'] || item.artwork['150x150'])) || '',
-              streamUrl: `${host}/v1/tracks/${item.id}/stream?app_name=nullmusic`,
-              backupUrl: '',
-              isFullStream: true
-            }));
-          }
-        } catch (e) {}
-      }
-      return [];
-    })();
+    let foundTracks = [];
 
-    const itunesPromise = (async () => {
+    for (const host of instances) {
       try {
-        const catUrl = `https://itunes.apple.com/search?term=${encodeURIComponent(cleanQuery)}&country=RU&media=music&entity=song&limit=25`;
-        const catData = await fetchJson(catUrl, 4500);
-        if (catData && Array.isArray(catData.results)) {
-          return catData.results;
+        const searchUrl = `${host}/api/v1/search?q=${encodeURIComponent(cleanQuery + ' music audio')}&type=video`;
+        const data = await fetchJson(searchUrl, 4500);
+        if (Array.isArray(data) && data.length > 0) {
+          foundTracks = data
+            .filter(item => item.videoId && item.lengthSeconds > 30)
+            .slice(0, 25)
+            .map(item => {
+              const durSec = item.lengthSeconds || 180;
+              const m = Math.floor(durSec / 60);
+              const s = Math.floor(durSec % 60);
+              const durationFormatted = `${m}:${s < 10 ? '0' : ''}${s}`;
+              
+              // Забираем качественную обложку из видеосервиса
+              const coverUrl = `https://i.ytimg.com/vi/${item.videoId}/hqdefault.jpg`;
+
+              return {
+                id: item.videoId,
+                title: item.title || 'Без названия',
+                artist: item.author || 'Исполнитель',
+                duration: durationFormatted,
+                rawDuration: durSec,
+                cover: coverUrl,
+                // Используем надежный инди-стрим шлюз для извлечения аудиодорожки
+                streamUrl: `https://co.wuk.sh/api/stream?url=https://www.youtube.com/watch?v=${item.videoId}`,
+                backupUrl: `https://invidious.nerdvpn.de/latest_version?id=${item.videoId}&itag=251`
+              };
+            });
+          if (foundTracks.length > 0) break;
         }
       } catch (e) {}
-      return [];
-    })();
-
-    const [audiusStreams, itunesResults] = await Promise.all([audiusPromise, itunesPromise]);
-
-    const tracks = itunesResults.map((item, idx) => {
-      const durSec = item.trackTimeMillis ? Math.round(item.trackTimeMillis / 1000) : 180;
-      const hiResCover = item.artworkUrl100 ? item.artworkUrl100.replace('100x100bb', '600x600bb') : '';
-      const tTitle = item.trackName || 'Без названия';
-      const tArtist = item.artistName || 'Исполнитель';
-
-      // Ищем подходящий полный поток по названию или артисту
-      const matchedFull = audiusStreams.find(a =>
-        a.title.toLowerCase().includes(tTitle.toLowerCase()) ||
-        tTitle.toLowerCase().includes(a.title.toLowerCase())
-      );
-
-      return {
-        id: String(item.trackId || idx),
-        title: tTitle,
-        artist: tArtist,
-        duration: formatDuration(durSec),
-        rawDuration: durSec,
-        cover: hiResCover,
-        streamUrl: matchedFull ? matchedFull.streamUrl : '',
-        backupUrl: item.previewUrl || '',
-        needsStreamResolve: !matchedFull
-      };
-    });
-
-    // Добавляем полные треки из Audius, которых не было в списке
-    for (const aTrack of audiusStreams) {
-      const exists = tracks.some(t =>
-        t.title.toLowerCase() === aTrack.title.toLowerCase() &&
-        t.artist.toLowerCase() === aTrack.artist.toLowerCase()
-      );
-      if (!exists) {
-        tracks.push(aTrack);
-      }
     }
 
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ tracks }));
+    return res.end(JSON.stringify({ tracks: foundTracks }));
   }
 
   res.writeHead(404, { 'Content-Type': 'application/json' });
@@ -233,5 +121,5 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`nullmusic server running on port ${PORT}`);
+  console.log(`nullmusic yt-backend running on port ${PORT}`);
 });
